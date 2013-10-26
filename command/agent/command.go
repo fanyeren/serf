@@ -22,48 +22,6 @@ type Command struct {
 	shuttingDown bool
 }
 
-func (c *Command) Help() string {
-	helpText := `
-Usage: serf agent [options]
-
-  Starts the Serf agent and runs until an interrupt is received. The
-  agent represents a single node in a cluster.
-
-Options:
-
-  -bind=0.0.0.0            Address to bind network listeners to
-  -event-handler=foo       Script to execute when events occur. This can
-                           be specified multiple times. See the event scripts
-                           section below for more info.
-  -log-level=info          Log level of the agent.
-  -node=hostname           Name of this node. Must be unique in the cluster
-  -role=foo                The role of this node, if any. This can be used
-                           by event scripts to differentiate different types
-                           of nodes that may be part of the same cluster.
-  -rpc-addr=127.0.0.1:7373 Address to bind the RPC listener.
-
-Event handlers:
-
-  For more information on what event handlers are, please read the
-  Serf documentation. This section will document how to configure them
-  on the command-line. There are three methods of specifying an event
-  handler:
-
-  - The value can be a plain script, such as "event.sh". In this case,
-    Serf will send all events to this script, and you'll be responsible
-    for differentiating between them based on the SERF_EVENT.
-
-  - The value can be in the format of "TYPE=SCRIPT", such as
-    "member-join=join.sh". With this format, Serf will only send events
-    of that type to that script.
-
-  - The value can be in the format of "user:EVENT=SCRIPT", such as
-    "user:deploy=deploy.sh". This means that Serf will only invoke this
-    script in the case of user events named "deploy".
-`
-	return strings.TrimSpace(helpText)
-}
-
 func (c *Command) Run(args []string, rawUi cli.Ui) int {
 	ui := &cli.PrefixedUi{
 		OutputPrefix: "==> ",
@@ -72,43 +30,48 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 		Ui:           rawUi,
 	}
 
-	var bindAddr string
-	var logLevel string
-	var eventHandlers []string
-	var nodeName string
-	var nodeRole string
-	var rpcAddr string
+	var cmdConfig Config
+	var configFiles []string
 
 	cmdFlags := flag.NewFlagSet("agent", flag.ContinueOnError)
 	cmdFlags.Usage = func() { ui.Output(c.Help()) }
-	cmdFlags.StringVar(&bindAddr, "bind", "0.0.0.0", "address to bind listeners to")
-	cmdFlags.Var((*AppendSliceValue)(&eventHandlers), "event-handler",
+	cmdFlags.StringVar(&cmdConfig.BindAddr, "bind", "", "address to bind listeners to")
+	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-file",
+		"json file to read config from")
+	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-dir",
+		"directory of json files to read")
+	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.EventHandlers), "event-handler",
 		"command to execute when events occur")
-	cmdFlags.StringVar(&logLevel, "log-level", "INFO", "log level")
-	cmdFlags.StringVar(&nodeName, "node", "", "node name")
-	cmdFlags.StringVar(&nodeRole, "role", "", "role name")
-	cmdFlags.StringVar(&rpcAddr, "rpc-addr", "127.0.0.1:7373",
+	cmdFlags.StringVar(&cmdConfig.LogLevel, "log-level", "", "log level")
+	cmdFlags.StringVar(&cmdConfig.NodeName, "node", "", "node name")
+	cmdFlags.StringVar(&cmdConfig.Role, "role", "", "role name")
+	cmdFlags.StringVar(&cmdConfig.RPCAddr, "rpc-addr", "",
 		"address to bind RPC listener to")
 	if err := cmdFlags.Parse(args); err != nil {
 		return 1
 	}
 
-	if nodeName == "" {
+	config := DefaultConfig
+	if len(configFiles) > 0 {
+		fileConfig, err := ReadConfigPaths(configFiles)
+		if err != nil {
+			rawUi.Error(err.Error())
+			return 1
+		}
+
+		config = MergeConfig(config, fileConfig)
+	}
+
+	config = MergeConfig(config, &cmdConfig)
+
+	if config.NodeName == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
 			rawUi.Error(fmt.Sprintf("Error determining hostname: %s", err))
 			return 1
 		}
 
-		nodeName = hostname
-	}
-
-	config := Config{
-		NodeName:      nodeName,
-		Role:          nodeRole,
-		BindAddr:      bindAddr,
-		RPCAddr:       rpcAddr,
-		EventHandlers: eventHandlers,
+		config.NodeName = hostname
 	}
 
 	eventScripts, err := config.EventScripts()
@@ -138,7 +101,7 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 	}
 
 	logLevelFilter := LevelFilter()
-	logLevelFilter.MinLevel = logutils.LogLevel(strings.ToUpper(logLevel))
+	logLevelFilter.MinLevel = logutils.LogLevel(strings.ToUpper(config.LogLevel))
 	logLevelFilter.Writer = logGate
 	if !ValidateLevelFilter(logLevelFilter) {
 		ui.Error(fmt.Sprintf(
@@ -151,8 +114,8 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 	serfConfig.MemberlistConfig.BindAddr = bindIP
 	serfConfig.MemberlistConfig.TCPPort = bindPort
 	serfConfig.MemberlistConfig.UDPPort = bindPort
-	serfConfig.NodeName = nodeName
-	serfConfig.Role = nodeRole
+	serfConfig.NodeName = config.NodeName
+	serfConfig.Role = config.Role
 
 	agent := &Agent{
 		EventHandler: &ScriptEventHandler{
@@ -163,7 +126,7 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 			Scripts: eventScripts,
 		},
 		LogOutput:  logLevelFilter,
-		RPCAddr:    rpcAddr,
+		RPCAddr:    config.RPCAddr,
 		SerfConfig: serfConfig,
 	}
 
@@ -176,7 +139,7 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 	ui.Output("Serf agent running!")
 	ui.Info(fmt.Sprintf("Node name: '%s'", config.NodeName))
 	ui.Info(fmt.Sprintf("Bind addr: '%s:%d'", bindIP, bindPort))
-	ui.Info(fmt.Sprintf(" RPC addr: '%s'", rpcAddr))
+	ui.Info(fmt.Sprintf(" RPC addr: '%s'", config.RPCAddr))
 	ui.Info("")
 	ui.Output("Log data will now stream in as it occurs:\n")
 	logGate.Flush()
@@ -190,10 +153,6 @@ func (c *Command) Run(args []string, rawUi cli.Ui) int {
 	}
 
 	return 0
-}
-
-func (c *Command) Synopsis() string {
-	return "Runs a Serf agent"
 }
 
 func (c *Command) startShutdownWatcher(agent *Agent, ui cli.Ui) (graceful <-chan struct{}, forceful <-chan struct{}) {
@@ -227,4 +186,56 @@ func (c *Command) startShutdownWatcher(agent *Agent, ui cli.Ui) (graceful <-chan
 	}()
 
 	return
+}
+
+func (c *Command) Synopsis() string {
+	return "Runs a Serf agent"
+}
+
+func (c *Command) Help() string {
+	helpText := `
+Usage: serf agent [options]
+
+  Starts the Serf agent and runs until an interrupt is received. The
+  agent represents a single node in a cluster.
+
+Options:
+
+  -bind=0.0.0.0            Address to bind network listeners to
+  -config-file=foo         Path to a JSON file to read configuration from.
+                           This can be specified multiple times.
+  -config-dir=foo          Path to a directory to read configuration files
+                           from. This will read every file ending in ".json"
+						   as configuration in this directory in alphabetical
+						   order.
+  -event-handler=foo       Script to execute when events occur. This can
+                           be specified multiple times. See the event scripts
+                           section below for more info.
+  -log-level=info          Log level of the agent.
+  -node=hostname           Name of this node. Must be unique in the cluster
+  -role=foo                The role of this node, if any. This can be used
+                           by event scripts to differentiate different types
+                           of nodes that may be part of the same cluster.
+  -rpc-addr=127.0.0.1:7373 Address to bind the RPC listener.
+
+Event handlers:
+
+  For more information on what event handlers are, please read the
+  Serf documentation. This section will document how to configure them
+  on the command-line. There are three methods of specifying an event
+  handler:
+
+  - The value can be a plain script, such as "event.sh". In this case,
+    Serf will send all events to this script, and you'll be responsible
+    for differentiating between them based on the SERF_EVENT.
+
+  - The value can be in the format of "TYPE=SCRIPT", such as
+    "member-join=join.sh". With this format, Serf will only send events
+    of that type to that script.
+
+  - The value can be in the format of "user:EVENT=SCRIPT", such as
+    "user:deploy=deploy.sh". This means that Serf will only invoke this
+    script in the case of user events named "deploy".
+`
+	return strings.TrimSpace(helpText)
 }
